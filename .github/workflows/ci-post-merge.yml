@@ -13,6 +13,8 @@ permissions:
 jobs:
 
   re-test:
+    outputs:
+      release_commit: ${{ startsWith(github.event.head_commit.message, 'Release v') }}
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -23,25 +25,10 @@ jobs:
     - name: Re-test
       run: make test
 
-  update-tag:
+  publish-latest-image-only:
+    if: needs.re-test.outputs.release_commit == 'false'
+    needs: re-test
     runs-on: ubuntu-latest
-    needs:
-    - re-test
-    outputs:
-      new_version: ${{ steps.tag_version.outputs.new_version }}
-    steps:
-    - uses: actions/checkout@v4
-    - name: Bump version and push tag
-      id: tag_version
-      uses: mathieudutour/github-tag-action@v6.2
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        default_bump: minor
-
-  docker-build:
-    runs-on: ubuntu-latest
-    needs:
-    - update-tag
     steps:
     - uses: actions/checkout@v4
     - name: Set up Docker Buildx
@@ -56,23 +43,27 @@ jobs:
       uses: aws-actions/amazon-ecr-login@v2
       with:
         registry-type: public
-    - name: Build, tag, and push to Amazon ECR
+    - name: Build and publish docker image
       uses: docker/build-push-action@v5
       with:
         file: ./build/server/Dockerfile
         push: true
         platforms: linux/amd64,linux/arm64
         tags: |
-          public.ecr.aws/cloudnatix/llmariner/user-manager-server:${{ needs.update-tag.outputs.new_version }}
           public.ecr.aws/cloudnatix/llmariner/user-manager-server:latest
 
-  publish-helm-chart:
+  release-image-and-chart:
+    if: needs.re-test.outputs.release_commit == 'true'
+    needs: re-test
     runs-on: ubuntu-latest
-    needs:
-    - update-tag
-    - docker-build
     steps:
     - uses: actions/checkout@v4
+    - name: Extract version
+      run: |
+        ver=$(echo "$COMMIT_MESSAGE"| head -n1 | awk '{print $2}' |sed 's/v//')
+        echo "version=${ver}" >> $GITHUB_ENV
+      env:
+        COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -83,9 +74,25 @@ jobs:
       uses: aws-actions/amazon-ecr-login@v2
       with:
         registry-type: public
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Build and publish docker image
+      uses: docker/build-push-action@v5
+      with:
+        file: ./build/server/Dockerfile
+        push: true
+        platforms: linux/amd64,linux/arm64
+        tags: |
+          public.ecr.aws/cloudnatix/llmariner/user-manager-server:${{ env.version }}
+          public.ecr.aws/cloudnatix/llmariner/user-manager-server:latest
     - name: Set up Helm
       uses: Azure/setup-helm@v4
-    - name: build and push server helm chart
+    - name: Build and publish server helm chart
       run: |
-        helm package --version ${{ needs.update-tag.outputs.new_version }} ./deployments/server
-        helm push user-manager-server-${{ needs.update-tag.outputs.new_version }}.tgz oci://public.ecr.aws/cloudnatix/llmariner-charts
+        helm package --version ${{ env.version }} ./deployments/server
+        helm push user-manager-server-${{ env.version }}.tgz oci://public.ecr.aws/cloudnatix/llmariner-charts
+    - name: Create release
+      uses: softprops/action-gh-release@v2.0.8
+      with:
+        tag_name: v${{ env.version }}
+        generate_release_notes: true
